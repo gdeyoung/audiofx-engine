@@ -32,6 +32,27 @@ sink-present check, with rollback to the previous default sink on failure.
 of apps (games go direct). A watcher (`audiofx-watch.service`) keeps streams
 on the right sink as apps come and go.
 
+## Mute & volume authority
+
+An FX chain creates two sinks where a plain setup has one, and mute state
+that lands on the wrong one is silent and invisible — the classic
+"it's muted somewhere and unmuted everywhere I can see" wedges. This engine
+enforces one model:
+
+- **The virtual sink (`gdy_audiofx`) is plumbing, not a control.** The
+  watcher's *guardian* pins it unmuted at 100% and reverts any flip within
+  about a second — whether it came from a UI bug, a stale node handle, or an
+  app that likes to mute things. Every repair is logged:
+  `journalctl --user -u audiofx-watch | grep guardian`.
+- **The physical output device is the only mute/volume control.** Speaker
+  icon, volume keys, pavucontrol — all of them speak for the real device,
+  and none of them can get shadowed by the chain.
+- **The mic is the mic.** Input mute lives on the default source, full stop.
+
+The [Audio FX panel](https://github.com/gdeyoung/omarchy-audiofx) writes
+mutes to both ends of the chain so its switches always match what you hear;
+the guardian makes the virtual end a no-op even if something else touches it.
+
 ## Install
 
 ```sh
@@ -53,6 +74,7 @@ into `~/.local/share/audiofx/hrir/`; no other network access.
 
 ```
 audiofx status                                # JSON: active, preset, target, mode, excluded
+audiofx doctor                                # audit the whole tree; exit 1 on wedges
 audiofx presets                               # the built-in presets
 audiofx apply '{"spatial":60,"bass":50,"night":0}'
 audiofx rules system                          # effects on everything
@@ -66,10 +88,39 @@ configs render to `~/.config/pipewire/audiofx.conf*`. Remove everything:
 `audiofx off`, delete the clone, `rm -rf ~/.local/share/audiofx
 ~/.config/pipewire/audiofx.conf*`.
 
+## Troubleshooting
+
+Run `audiofx doctor` first — it prints the whole tree (default sink and
+source, both sinks' mute/volume, routing mode) and exits non-zero on the
+known wedge states:
+
+```console
+$ audiofx doctor
+{"engine": "active", "mode": "system", "defaultSink": "gdy_audiofx",
+ "defaultSource": "alsa_input...Mic1__source", "target": "alsa_output...Speaker__sink",
+ "virtualVolume": 1.0, "targetMuted": false, "targetVolume": 0.4,
+ "sourceMuted": false, "faults": [], "warnings": [], "ok": true}
+```
+
+The faults it names, and their fixes:
+
+| Fault | Meaning | Fix |
+| --- | --- | --- |
+| virtual sink is MUTED / volume ≠ 100% | plumbing was tampered with | should self-heal in ~1s; if not, `systemctl --user restart audiofx-watch` |
+| streams playing into MUTED target | audio is playing but the speakers are muted — audible to nobody | unmute the output (panel switch or volume keys) |
+| default source is MUTED | mic input dead: dictation and calls get silence | unmute the input (panel INPUT switch) |
+
+Guardian repairs are visible as they happen:
+
+```console
+$ journalctl --user -u audiofx-watch | grep guardian
+Oct 17 11:24:23 sammypro5 python3[788922]: [guardian] unmuted gdy_audiofx
+```
+
 ## Files
 
 - `audiofx.py` — engine: graph builder, config renderer, unit host, apply/
-  status/rules/off transaction logic
+  status/rules/off transaction logic, mute-authority guardian, `doctor` audit
 - `irgen.py` — numpy IR generator for bass/night (48 kHz stereo float WAVs)
 
 ## License
