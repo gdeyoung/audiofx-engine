@@ -1,5 +1,7 @@
 # audiofx — system-wide audio effects for PipeWire
 
+![audiofx engine](preview.png)
+
 A Boom 3D-style effects engine built natively on PipeWire: one virtual sink
 (`gdy_audiofx`) that every app plays into, processed by a filter-chain and
 passed through to your real output. No root, no driver changes, no daemon
