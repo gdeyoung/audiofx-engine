@@ -254,6 +254,68 @@ def pactl_sink_names():
     return [ln.split("\t")[1] for ln in r.stdout.splitlines() if ln.strip()]
 
 
+def node_muted(kind, name):
+    """True if sink/source `name` is muted. kind: 'sinks'|'sources'."""
+    try:
+        r = run(["pactl", "list", kind])
+    except Exception:
+        return False
+    cur = None
+    muted = False
+    for ln in r.stdout.splitlines():
+        if ln.startswith(("Sink #", "Source #")):
+            cur = None
+        elif cur is None and ln.strip().startswith("Name:"):
+            cur = ln.split(":", 1)[1].strip()
+        elif cur == name and ln.strip().startswith("Mute:"):
+            muted = ln.split(":", 1)[1].strip().lower() == "yes"
+    return muted
+
+
+def node_volume(kind, name):
+    """Volume of sink/source `name` as 0..1 float (first channel), or None."""
+    import re
+    try:
+        r = run(["pactl", "list", kind])
+    except Exception:
+        return None
+    cur = None
+    vol = None
+    for ln in r.stdout.splitlines():
+        if ln.startswith(("Sink #", "Source #")):
+            cur = None
+        elif cur is None and ln.strip().startswith("Name:"):
+            cur = ln.split(":", 1)[1].strip()
+        elif cur == name and "Volume:" in ln and vol is None:
+            # Line shape: 'Volume: front-left: 65536 / 100% / 0.00 dB, ...'
+            mm = re.search(r":\s*\d+\s*/\s*(\d+)%", ln)
+            raw = re.search(r":\s*(\d+)\s*/\s*\d+%", ln)
+            if mm:
+                vol = int(mm.group(1)) / 100.0
+            elif raw:
+                vol = int(raw.group(1)) / 65536.0
+    return vol
+
+
+def guardian_pass(state):
+    """The virtual sink is plumbing, not a control surface: pin it unmuted at
+    1.00 so muting it can never wedge the chain. The PHYSICAL target sink is
+    the user's mute/volume control and is never touched here. Every repair is
+    logged so 'who muted what' is answerable from journald later."""
+    if not sink_present():
+        return
+    fixes = []
+    if node_muted("sinks", SINK_NAME):
+        run(["pactl", "set-sink-mute", SINK_NAME, "0"])
+        fixes.append("unmuted %s" % SINK_NAME)
+    v = node_volume("sinks", SINK_NAME)
+    if v is not None and abs(v - 1.0) > 0.01:
+        run(["pactl", "set-sink-volume", SINK_NAME, "100%"])
+        fixes.append("reset %s volume %.0f%% -> 100%%" % (SINK_NAME, v * 100))
+    if fixes:
+        print("[guardian] %s" % "; ".join(fixes), flush=True)
+
+
 def sink_present():
     return SINK_NAME in pactl_sink_names()
 
@@ -440,6 +502,7 @@ def action_watch():
                 continue
             if mode != last_mode or excluded != last_excluded:
                 reconcile(mode, excluded)
+                guardian_pass(state)
                 last_mode, last_excluded = mode, excluded
                 continue
             line = p.stdout.readline()
@@ -452,8 +515,63 @@ def action_watch():
             if "'change' on sink-input" in line or "'new' on sink-input" in line:
                 time.sleep(0.15)
                 reconcile(mode, excluded)
+            elif "'change' on sink #" in line or "'change' on source #" in line:
+                # Mute/volume/default flips (panel, keys, apps like Steam)
+                # reconcile instantly; the virtual sink is pinned as plumbing.
+                time.sleep(0.1)
+                guardian_pass(state)
     finally:
         p.terminate()
+
+
+def action_doctor():
+    """One-shot audit of the whole audio tree. Exit 1 if anything is wedged:
+    the split-brain states that silently kill sound or mic input."""
+    state = load_state() or {}
+    active = sink_present()
+    default_sink = run(["pactl", "get-default-sink"]).stdout.strip()
+    default_source = run(["pactl", "get-default-source"]).stdout.strip()
+    target = state.get("target", "")
+    out = {
+        "engine": "active" if active else "off",
+        "mode": state.get("mode", "system"),
+        "defaultSink": default_sink,
+        "defaultSource": default_source,
+        "target": target,
+        "faults": [],
+        "warnings": [],
+    }
+    if active:
+        if node_muted("sinks", SINK_NAME):
+            out["faults"].append(
+                "virtual sink %s is MUTED (plumbing; guardian should heal — restart audiofx-watch)" % SINK_NAME)
+        v = node_volume("sinks", SINK_NAME)
+        out["virtualVolume"] = round(v, 3) if v is not None else None
+        if v is not None and abs(v - 1.0) > 0.01:
+            out["faults"].append(
+                "virtual sink volume %.0f%% != 100%% (plumbing; guardian should heal)" % (v * 100))
+        if state.get("mode", "system") == "system" and default_sink != SINK_NAME:
+            out["warnings"].append(
+                "mode=system but default sink is %s, not %s" % (default_sink, SINK_NAME))
+    if target:
+        if target not in pactl_sink_names():
+            out["warnings"].append("target sink %s not present (undocked/headphones?)" % target)
+        else:
+            out["targetMuted"] = node_muted("sinks", target)
+            tv = node_volume("sinks", target)
+            out["targetVolume"] = round(tv, 3) if tv is not None else None
+            if out["targetMuted"] and stream_entries():
+                out["faults"].append(
+                    "%d stream(s) playing into MUTED %s — audible-to-nobody (unmute output)" %
+                    (len(stream_entries()), target))
+    out["sourceMuted"] = node_muted("sources", default_source)
+    if out["sourceMuted"]:
+        out["faults"].append(
+            "default source %s is MUTED — no mic input (voxtype/calls dead)" % default_source)
+    out["ok"] = not out["faults"]
+    print(json.dumps(out))
+    if not out["ok"]:
+        sys.exit(1)
 
 
 def action_presets():
@@ -549,12 +667,14 @@ def action_off():
 
 def main(argv):
     if len(argv) < 2:
-        die("usage: audiofx.py status|presets|apply '<json>'|rules <mode> '<excluded-json>'|watch|off", 2)
+        die("usage: audiofx.py status|presets|doctor|apply '<json>'|rules <mode> '<excluded-json>'|watch|off", 2)
     cmd = argv[1]
     if cmd == "status":
         action_status()
     elif cmd == "presets":
         action_presets()
+    elif cmd == "doctor":
+        action_doctor()
     elif cmd == "apply":
         if len(argv) < 3:
             die("apply needs an argument")
