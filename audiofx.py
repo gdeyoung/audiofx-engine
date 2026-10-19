@@ -90,16 +90,26 @@ HRIR_MAP = {
 POSITIONS = ["FL", "FR", "FC", "LFE", "RL", "RR", "SL", "SR"]
 
 
-def build_graph(spatial, bass, night):
-    """Compose [ 3D bank ] -> [ bass IR ] -> [ night IR ].
+def build_graph(spatial, bass, night, loud=0):
+    """Compose [ 3D bank ] -> [ bass IR ] -> [ night IR ] -> [ Loud stage ].
 
     Returns (nodes, links, inputs, outputs, capture_positions).
     Bypassed stages are simply absent from the chain.
+
+    Loud stage (loud 1..100): a fixed 120 Hz high-pass IR pair feeding one
+    stereo SWH fastLookaheadLimiter whose Input gain carries the loudness
+    (+loud*6/100 dB) and Limit pins the ceiling at -1 dBFS. The high-pass
+    removes sub-120 Hz energy these drivers cannot reproduce, which is what
+    trips the MAX98390 amps' excursion limiter — without it the amp DSP
+    normalizes any software gain away (measured, 2026-10-18). Same shape as
+    upstream's GalaxyBook EasyEffects "Loud" presets (limiter input gain +
+    120 Hz HP, validated by mic recordings).
     """
     nodes = []
     links = []
     inputs = None
     src_l = src_r = None  # node names feeding the next stage
+    out_l = out_r = None  # full output port names of the last stage
 
     if spatial > 0:
         w = spatial / 100.0
@@ -141,6 +151,9 @@ def build_graph(spatial, bass, night):
     else:
         capture_positions = ["FL", "FR"]
 
+    if src_l:
+        out_l, out_r = "%s:Out" % src_l, "%s:Out" % src_r
+
     for label, amount, ir in (("Bass", bass, "bass.wav"), ("Night", night, "night.wav")):
         if amount <= 0:
             continue
@@ -154,17 +167,39 @@ def build_graph(spatial, bass, night):
         else:
             inputs = [nl + ":In", nr + ":In"]  # first stage consumes capture directly
         src_l, src_r = nl, nr
+        out_l, out_r = nl + ":Out", nr + ":Out"
 
-    if not src_l:
+    if loud > 0:
+        gain_db = round(loud * 6.0 / 100.0, 2)
+        nl, nr = "convHp_L", "convHp_R"
+        for n in (nl, nr):
+            nodes.append({"type": "builtin", "label": "convolver", "name": n,
+                          "config": {"filename": os.path.join(IR_DIR, "hp.wav"), "channel": 0}})
+        if src_l:
+            links.append({"output": "%s:Out" % src_l, "input": "%s:In" % nl})
+            links.append({"output": "%s:Out" % src_r, "input": "%s:In" % nr})
+        else:
+            inputs = [nl + ":In", nr + ":In"]
+        nodes.append({"type": "ladspa", "name": "loudLim",
+                      "plugin": "fast_lookahead_limiter_1913",
+                      "label": "fastLookaheadLimiter",
+                      "control": {"Input gain (dB)": gain_db,
+                                  "Limit (dB)": -1.0,
+                                  "Release time (s)": 0.02}})
+        links.append({"output": "%s:Out" % nl, "input": "loudLim:Input 1"})
+        links.append({"output": "%s:Out" % nr, "input": "loudLim:Input 2"})
+        out_l, out_r = "loudLim:Output 1", "loudLim:Output 2"
+
+    if out_l is None:
         die("no active effects in preset")
-    outputs = ["%s:Out" % src_l, "%s:Out" % src_r]
+    outputs = [out_l, out_r]
     return nodes, links, inputs, outputs, capture_positions
 
 
 # ---------------- config rendering ----------------
 
-def render_fragment(target_sink, spatial, bass, night):
-    nodes, links, inputs, outputs, cap_pos = build_graph(spatial, bass, night)
+def render_fragment(target_sink, spatial, bass, night, loud=0):
+    nodes, links, inputs, outputs, cap_pos = build_graph(spatial, bass, night, loud)
     graph = {
         "nodes": nodes,
         "links": links,
@@ -394,13 +429,16 @@ def ensure_hrir():
     os.replace(tmp, HRIR)
 
 
-def regen_irs(spatial, bass, night):
+def regen_irs(spatial, bass, night, loud=0):
     os.makedirs(IR_DIR, exist_ok=True)
     calls = []
     if bass > 0:
         calls.append([sys.executable, os.path.join(SCRIPT_DIR, "irgen.py"), IR_DIR, "bass", str(bass)])
     if night > 0:
         calls.append([sys.executable, os.path.join(SCRIPT_DIR, "irgen.py"), IR_DIR, "night", str(night)])
+    if loud > 0 and not os.path.isfile(os.path.join(IR_DIR, "hp.wav")):
+        # fixed shape, generated once
+        calls.append([sys.executable, os.path.join(SCRIPT_DIR, "irgen.py"), IR_DIR, "hp"])
     for cmd in calls:
         r = run(cmd)
         if r.returncode != 0:
@@ -455,7 +493,7 @@ def action_status():
     out = {
         "active": active,
         "unit": unit or "inactive",
-        "preset": {k: state.get(k, 0) for k in ("spatial", "bass", "night")},
+        "preset": {k: state.get(k, 0) for k in ("spatial", "bass", "night", "loud")},
         "target": state.get("target", ""),
         "sink": SINK_NAME,
         "hrir": os.path.isfile(HRIR),
@@ -593,16 +631,22 @@ def action_apply(arg):
     for v in (spatial, bass, night):
         if not 0 <= v <= 100:
             die("effect amounts must be 0..100")
-    if spatial == 0 and bass == 0 and night == 0:
-        return action_off()
 
     prev = load_state() or {}
+    # loud is orthogonal to the presets: absent key inherits the previous
+    # loud amount so preset switches never stomp it; explicit 0 disables it.
+    loud = int(preset["loud"]) if "loud" in preset else int(prev.get("loud", 0) or 0)
+    if not 0 <= loud <= 100:
+        die("loud must be 0..100")
+    if spatial == 0 and bass == 0 and night == 0 and loud == 0:
+        return action_off()
+
     mode = prev.get("mode", "system")
     excluded = prev.get("excluded", [])
 
     if spatial > 0:
         ensure_hrir()
-    regen_irs(spatial, bass, night)
+    regen_irs(spatial, bass, night, loud)
     target = resolve_target_sink()
     prev_default = run(["pactl", "get-default-sink"]).stdout.strip()
 
@@ -610,7 +654,7 @@ def action_apply(arg):
     with open(HOST_CONF, "w") as fh:
         fh.write(HOST_CONF_TEXT)
     with open(FRAGMENT, "w") as fh:
-        fh.write(render_fragment(target, spatial, bass, night))
+        fh.write(render_fragment(target, spatial, bass, night, loud))
     os.makedirs(os.path.dirname(UNIT_PATH), exist_ok=True)
     with open(UNIT_PATH, "w") as fh:
         fh.write(UNIT_TEXT)
@@ -628,9 +672,10 @@ def action_apply(arg):
     if mode == "system":
         run(["pactl", "set-default-sink", SINK_NAME])
     reconcile(mode, excluded)
-    save_state({"spatial": spatial, "bass": bass, "night": night,
+    save_state({"spatial": spatial, "bass": bass, "night": night, "loud": loud,
                 "target": target, "mode": mode, "excluded": excluded})
-    print(json.dumps({"ok": True, "preset": {"spatial": spatial, "bass": bass, "night": night},
+    print(json.dumps({"ok": True, "preset": {"spatial": spatial, "bass": bass, "night": night,
+                                             "loud": loud},
                       "target": target, "mode": mode}))
 
 

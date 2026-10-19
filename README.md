@@ -20,10 +20,23 @@ terminal or window manager.
 - **Night** — spectral night mode: pulls down lows/highs, lifts dialogue
   presence, for late-hour listening
 - **Movie** — 3D 40% + bass 45% + night 35% composed in one graph
+- **Loud** — orthogonal to the presets (own chip, 0–100 → 0…+6 dB): a fixed
+  120 Hz high-pass IR pair feeding one stereo SWH `fastLookaheadLimiter`
+  (`swh-plugins`, LADSPA) whose input gain carries the loudness and whose
+  limit pins the ceiling at −1 dBFS. Why this shape: the MAX98390 amps'
+  excursion limiter normalizes plain software gain away (measured four ways,
+  2026-10-18 — a +6 dB pre-gain returned −0.6 dB), but high-passing the
+  sub-120 Hz energy the drivers cannot reproduce frees the amps' budget, and
+  gain into a lookahead limiter then lands — the same construction as the
+  upstream GalaxyBook EasyEffects "Loud" presets. Ear-validated on the
+  Book5 Pro 16": +6 dB is clearly audible, no audible distortion.
 
-Effects compose — the graph is `[ 3D bank ] -> [ bass IR ] -> [ night IR ]`
-with bypassed stages absent — and amounts are continuous (0–100), so any mix
-is valid. Preset switches restart only the engine's own PipeWire client,
+Effects compose — the graph is `[ 3D bank ] -> [ bass IR ] -> [ night IR ] ->
+[ Loud stage ]` with bypassed stages absent — and amounts are continuous
+(0–100), so any mix is valid. Loud is inherited across preset switches: an
+`apply` payload without a `loud` key keeps the current loud amount; explicit
+`"loud": 0` disables it; all four at zero turns the engine off. Preset
+switches restart only the engine's own PipeWire client,
 never the daemon, so Spotify, browsers and Steam never drop their
 connection. Apply is transactional: config render → unit restart →
 sink-present check, with rollback to the previous default sink on failure.
@@ -56,9 +69,13 @@ the guardian makes the virtual end a no-op even if something else touches it.
 ## Install
 
 ```sh
-git clone https://github.com/gdeyoung/audiofx-engine ~/audiofx-engine
-mkdir -p ~/.local/bin && ln -s ~/audiofx-engine/audiofx.py ~/.local/bin/audiofx
-audiofx apply '{"spatial":60,"bass":50,"night":0}'
+git clone https://github.com/gdeyoung/audiofx-engine ~/omarchy-audiofx
+mkdir -p ~/.local/bin
+cp ~/omarchy-audiofx/audiofx.py ~/omarchy-audiofx/irgen.py ~/.local/bin/
+chmod +x ~/.local/bin/audiofx.py
+# swh-plugins supplies the Loud stage's limiter (LADSPA):
+sudo pacman -S --needed swh-plugins
+audiofx apply '{"spatial":60,"bass":50,"night":0,"loud":100}'
 ```
 
 The first `apply` writes and enables the two systemd user units

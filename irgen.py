@@ -78,13 +78,31 @@ def write_wav(path, ir):
         w.writeframes(frames)
 
 
+HP_FC = 120.0           # Hz — loud stage high-pass corner
+HP_DC_GAIN_DB = -30.0   # attenuation at DC; frees the amps' excursion budget
+                        # below what these drivers can reproduce (upstream
+                        # GalaxyBook EasyEffects presets do the same)
+
+
 def main():
-    if len(sys.argv) != 4:
-        sys.exit("usage: irgen.py <ir_dir> bass|night <0-100>")
-    ir_dir, kind, level_s = sys.argv[1], sys.argv[2], sys.argv[3]
-    level = int(level_s)
-    if kind not in ("bass", "night") or not 0 < level <= 100:
-        sys.exit("kind must be bass|night, level 1..100")
+    if len(sys.argv) not in (3, 4):
+        sys.exit("usage: irgen.py <ir_dir> bass|night <0-100> | irgen.py <ir_dir> hp")
+    ir_dir, kind = sys.argv[1], sys.argv[2]
+
+    if kind == "hp":
+        # "boost" mode with g < 1 is a high-shelf down = high-pass: DC gain g,
+        # HF unity. Fixed shape; no strength parameter.
+        ir = shelf_ir(HP_FC, HP_DC_GAIN_DB, "boost")
+        os.makedirs(ir_dir, exist_ok=True)
+        out = os.path.join(ir_dir, "hp.wav")
+        write_wav(out, ir)
+        print("hp: high-pass fc=%.0f g=%.2f -> %s (%d taps, peak=%.3f)"
+              % (HP_FC, db_to_gain(HP_DC_GAIN_DB), out, TAPS, max(abs(x) for x in ir)))
+        return
+
+    if kind not in ("bass", "night") or len(sys.argv) != 4 or not 0 < int(sys.argv[3]) <= 100:
+        sys.exit("kind must be bass|night with level 1..100, or hp")
+    level = int(sys.argv[3])
 
     if kind == "bass":
         ir = shelf_ir(BASS_FC, level * BASS_DB_PER_PT, "boost")
